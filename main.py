@@ -1,105 +1,135 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama.llms import OllamaLLM
+import json
+import re
+import logging
 
-# Define the template with conditional formatting
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Configure CORS to allow all origins
+CORS(app)
+
+# Add CORS headers to all responses
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# Recipe generation template
+
 template = """
-Using ONLY these ingredients: {question}
+Using the ingredients: {ingredients}
+Create {num_recipes} recipe(s).
 
-Create {num_recipes} recipe(s) with the following specifications:
-{detail_level}
-{macro_info}
+Return ONLY a JSON object with NO additional text, formatted EXACTLY as shown:
+{{
+    "recipes": [
+        {{
+            "recipe_name": "Recipe Name",
+            "cooking_time": "X minutes",
+            "difficulty": "Easy/Medium/Hard",
+            "nutrition": {{
+                "calories": "X calories per serving",
+                "protein": "X grams per serving"
+            }},
+            "ingredients_list": ["ingredient 1", "ingredient 2"],
+            "instructions": ["Step 1", "Step 2"],
+            "tips": "Cooking tips"
+        }}
+    ]
+}}
+"""
 
-Only suggest recipes that use EXCLUSIVELY the ingredients provided. Do not assume availability of any additional ingredients.
-
-Answer:"""
-
-def get_recipe_details(is_detailed):
-    if is_detailed:
-        return """For each recipe include:
-- Recipe name
-- Detailed step-by-step instructions
-- Cooking time and temperature where applicable
-- Precise measurements
-- Cooking tips and techniques"""
-    else:
-        return """For each recipe include:
-- Recipe name
-- Brief 2-3 step instructions
-- Approximate cooking time"""
-
-def get_macro_request(include_macros):
-    if include_macros:
-        return """For each recipe, include nutritional information:
-- Total calories
-- Protein content
-- Carbohydrates
-- Fat content"""
-    return ""
-
-def get_recipes(ingredients, num_recipes, is_detailed, include_macros):
-    detail_level = get_recipe_details(is_detailed)
-    macro_info = get_macro_request(include_macros)
-    
-    # Create the prompt template
-    prompt = ChatPromptTemplate.from_template(template)
-    
-    # Initialize the model
-    model = OllamaLLM(model="llama3.2:1b")
-    
-    # Create the chain
-    chain = prompt | model
-    
-    return chain.invoke({
-        "question": ingredients,
-        "num_recipes": num_recipes,
-        "detail_level": detail_level,
-        "macro_info": macro_info
-    })
-
-def main():
-    # Get ingredients
-    ingredients = input("Enter your available ingredients (separate with commas): ")
-    
-    # Get number of recipes
-    while True:
-        try:
-            num_recipes = int(input("\nHow many recipes would you like? (enter a number): "))
-            if num_recipes > 0:
-                break
-            print("Please enter a positive number.")
-        except ValueError:
-            print("Please enter a valid number.")
-    
-    # Get detail level preference
-    while True:
-        detail_choice = input("\nWould you like detailed or basic recipes? (detailed/basic): ").lower()
-        if detail_choice in ['detailed', 'basic']:
-            break
-        print("Please enter either 'detailed' or 'basic'.")
-    is_detailed = detail_choice == 'detailed'
-    
-    # Get macro preference
-    while True:
-        macro_choice = input("\nWould you like to include nutritional information (macros)? (yes/no): ").lower()
-        if macro_choice in ['yes', 'no', 'y', 'n']:
-            break
-        print("Please enter 'yes' or 'no'.")
-    include_macros = macro_choice.startswith('y')
-    
-
-    print("\nGenerating your recipes...")
-    recipes = get_recipes(ingredients, num_recipes, is_detailed, include_macros)
-    print(recipes)
-    
-    while True:
-        more = input("\nWould you like more recipes with these ingredients? (yes/no): ").lower()
-        if more not in ['yes', 'y']:
-            print("Thank you for using the recipe generator!")
-            break
+def get_recipes(ingredients, num_recipes):
+    try:
+        # Use the updated template
+        prompt = ChatPromptTemplate.from_template(template)
+        model = OllamaLLM(model="llama3.2")
+        chain = prompt | model
         
-        print("\nGenerating more recipes...")
-        recipes = get_recipes(ingredients, num_recipes, is_detailed, include_macros)
-        print(recipes)
+        response = chain.invoke({
+            "ingredients": ingredients,
+            "num_recipes": num_recipes
+        })
+        
+        print("Raw LLM response:", response)
+        
+        # Find and clean JSON from response
+        match = re.search(r'(\{[\s\S]*\})', response)
+        if not match:
+            return {"recipes": [], "error": "No valid JSON found in response"}
+            
+        try:
+            cleaned_data = json.loads(match.group(1))
+            return cleaned_data
+        except json.JSONDecodeError as e:
+            print(f"JSON parse error: {e}")
+            return {"recipes": [], "error": "Invalid JSON format"}
+            
+    except Exception as e:
+        print(f"Error in get_recipes: {e}")
+        return {"recipes": [], "error": str(e)}
+
+
+
+
+
+@app.route('/generate-recipes', methods=['POST', 'OPTIONS'])
+def generate_recipes():
+    if request.method == 'OPTIONS':
+        return '', 204
+        
+    logger.info("Received recipe generation request")
+    try:
+        data = request.get_json()
+        logger.info(f"Request data: {data}")
+        
+        # Validate request data
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        if 'ingredients' not in data or 'num_recipes' not in data:
+            return jsonify({"error": "Missing required parameters"}), 400
+            
+        ingredients = data['ingredients']
+        num_recipes = int(data['num_recipes'])
+        
+        # Validate input values
+        if not ingredients:
+            return jsonify({"error": "Ingredients list cannot be empty"}), 400
+            
+        if num_recipes < 1:
+            return jsonify({"error": "Number of recipes must be at least 1"}), 400
+            
+        result = get_recipes(ingredients, num_recipes)
+        
+        logger.info("Successfully generated recipes")
+        return jsonify(result)
+        
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON in request")
+        return jsonify({"error": "Invalid JSON format"}), 400
+    except ValueError as e:
+        logger.error(f"Value error: {e}")
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "message": "Server is running"
+    }), 200
 
 if __name__ == "__main__":
-    main()
+    logger.info("Starting Flask server...")
+    app.run(host='0.0.0.0', port=5001, debug=True)
